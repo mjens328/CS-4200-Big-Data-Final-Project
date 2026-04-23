@@ -1,0 +1,805 @@
+---
+title: "**CS 4200 Final Project: JobFit Pipeline**"
+subtitle: |
+  Due April 22, 2026\
+  Name: Melanie Jensen
+format: 
+  html:
+    embed-resources: true
+urlcolor: blue
+execute: 
+  eval: true
+  echo: true
+  message: false
+editor_options: 
+  chunk_output_type: console
+---
+
+This is a project to automate job searching based on Indeed.com listings. The project starts out by scraping a specified number of job listings based on provided job parameters. The scraped data is then stored in JSON format in a MongoDB database to simulate real-world processes with larger data. In the next step, the code uses a user-provided resume to perform natural language processing (NLP) to calibrate a match score (cosine similarity score, 0-1) for each job listing based on the relevance of the job description to the resume. The job descriptions are then sorted by match score (highest to lowest) and stored in a CSV file.
+
+The purpose of this project is to demonstrate an end-to-end workflow that mirrors the structure of a production-scale job matching system. The same pattern implemented here at a small scale, ingest, store, embed, score, rank, and serve, is used by enterprise platforms to match candidates against listings at much larger volumes. Migrating this project to a cloud data platform such as Snowflake would replace MongoDB with warehouse tables, shift the embedding and similarity calculations into in-database functions (Snowflake Cortex, for example) that run in parallel against millions of rows, and expose the ranked results as a queryable view rather than a CSV file. The scraping layer would still run externally, but every downstream step would scale horizontally with no change to the underlying logic. This project is intentionally built to make that migration path clear, with each stage of the pipeline isolated and minimally coupled to its storage layer.
+
+Beyond the base match score, the NLP pipeline also filters out boilerplate content from the scraped descriptions, detects years-of-experience requirements in the job posting, and compares those requirements against dated sections of the resume. Job descriptions that require substantially more experience than the resume reflects are flagged as disqualified and scored as zero, which moves them to the bottom of the ranking.
+
+Next steps for this project include setting up an automated running schedule for this code such that it will run on a regular basis to provide regular updates on new job listings that are relevant to the user. Another feature to add is an email or text notification system to alert the user when a matching score is created that is above a certain threshold.
+
+Elements featured in this project include:
+- Python
+- JSON
+- MongoDB
+- Sorting
+- Natural Language Processing (NLP)
+- Data Scraping
+- Automation
+
+# Setup
+
+Run the pip install cell once to ensure all dependencies are installed. To avoid reinstalling every time, the code is commented out.
+
+```{python}
+#| label: pip_install
+
+'''
+%pip install playwright motor nest_asyncio --quiet
+!playwright install chromium
+
+%pip install playwright-stealth --quiet
+
+%pip install sentence-transformers pymupdf --quiet
+'''
+
+```
+
+```{python}
+#| label: libraries
+
+import asyncio
+import random
+from torch._inductor.config import search_autotune_cache
+import nest_asyncio
+from playwright.async_api import async_playwright
+from motor.motor_asyncio import AsyncIOMotorClient
+import shutil
+from datetime import datetime, timezone
+from playwright_stealth import Stealth
+
+import os
+import fitz
+
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+import re
+import csv
+
+```
+
+# Data Scraping
+
+The first step of this project is to scrape job listings and their information off Indeed.com. This scraping is based on the parameters defined in the config cell below. Steps are taken throughout the process to make the scraping appear more human-like to avoid blocks and CAPTCHAs.
+
+```{python}
+#| label: config
+
+nest_asyncio.apply()
+reset_session = False
+
+mongo_URI = "mongodb+srv://meljensen328_db_user:Melajens10282003*@cluster0.u3zrhvc.mongodb.net/?appName=Cluster0"
+db_name = "indeed_jobs_db"
+collection_name = "listings"
+
+search_query = "data scientist"
+search_location = "Salt Lake City, UT"
+limit = 3
+
+print("Config loaded")
+print(f"  Searching : {search_query} in {search_location}")
+print(f"  Limit     : {limit} jobs")
+
+```
+
+## Data Scraping Function
+
+```{python}
+#| label: scrape_jobs
+
+def clean_job_description(text: str, job_title: str = "") -> str:
+    if not text or text == "N/A":
+        return text
+    
+    original = text
+    
+    section_headers = [
+        "responsibilities", "requirements", "qualifications",
+        "what you'll do", "what you will do", "what we're looking for",
+        "what we are looking for", "what you'll bring", "what you will bring",
+        "minimum qualifications", "preferred qualifications", "basic qualifications",
+        "required qualifications", "required skills", "preferred skills",
+        "job description", "job duties", "duties", "role overview",
+        "about the role", "about this role", "about the job", "the role",
+        "key responsibilities", "essential functions", "essential duties",
+        "skills and experience", "skills & experience", "experience required"]
+    
+    lines = text.splitlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        line_clean = line.strip().lower().rstrip(":").rstrip()
+        if any(line_clean == h or line_clean.startswith(h) for h in section_headers):
+            start_idx = i
+            break
+    
+    if start_idx is not None:
+        text = "\n".join(lines[start_idx:])
+    
+    boilerplate_triggers = [
+        "equal opportunity employer", "equal employment opportunity",
+        "eeo", "e.e.o", "affirmative action",
+        "reasonable accommodation", "reasonable accommodations",
+        "committed to diversity", "commitment to diversity",
+        "diversity and inclusion", "diversity, equity",
+        "without regard to race", "regardless of race",
+        "protected veteran", "protected class",
+        "background check", "background screening",
+        "drug screen", "drug test",
+        "e-verify", "everify",
+        "americans with disabilities act", "ada ",
+        "pay transparency", "pay range disclosure",
+        "benefits include", "benefits package",
+        "we offer competitive", "our benefits",
+        "about us", "about our company", "about the company",
+        "who we are", "our mission", "our values",
+        "by applying", "by submitting your application"]
+    
+    text_lower = text.lower()
+    cut_idx = None
+    for trigger in boilerplate_triggers:
+        idx = text_lower.find(trigger)
+        if idx != -1 and (cut_idx is None or idx < cut_idx):
+            cut_idx = idx
+    
+    if cut_idx is not None:
+        text = text[:cut_idx].rstrip()
+    
+    if len(text.strip()) < 100:
+        label = f" for '{job_title}'" if job_title else ""
+        print(f"    Warning: Could not cleanly filter description{label} — using full text.")
+        return original
+    
+    return text
+
+async def scrape_to_mongo(): 
+    session_dir = "./indeed_browser_session"
+    if reset_session and os.path.exists(session_dir):
+        shutil.rmtree(session_dir)
+        print("Browser session wiped — starting fresh.")
+    
+    client = AsyncIOMotorClient(mongo_URI)
+    db = client[db_name]
+    collection = db[collection_name]
+    
+    await collection.delete_many({})
+    print("Cleared existing job listings in MongoDB collection.")
+
+    q = search_query.replace(" ", "+")
+    loc = search_location.replace(" ", "+")
+    url = f"https://www.indeed.com/jobs?q={q}&l={loc}&sort=date"
+    print(f"Scraping URL: {url}\n")
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir = session_dir,
+            headless = False,
+            args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-web-security"],
+            user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"),
+            viewport = {"width": 1280, "height": 800},
+            locale = "en-US",
+            timezone_id = "America/Denver")
+        
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        await asyncio.sleep(random.uniform(2, 4))
+        await page.mouse.move(random.randint(300,700), random.randint(200, 400))
+        await page.evaluate("window.scrollBy(0, 300)")
+        await asyncio.sleep(random.uniform(1, 2))
+
+        try:
+            await page.wait_for_selector(".job_seen_beacon", timeout = 15000)
+        except Exception:
+            print("No job cards found — a CAPTCHA or block may be present.")
+            print("Solve it in the browser window now. Waiting up to 2 minutes...")
+            try:
+                await page.wait_for_selector(".job_seen_beacon", timeout = 120000)
+                print("CAPTCHA solved — continuing.")
+            except Exception:
+                print("Timed out waiting for CAPTCHA solve.")
+                await context.close()
+                return
+
+        job_cards = await page.query_selector_all(".job_seen_beacon")
+        job_cards = job_cards[:limit]
+        print(f"Found {len(job_cards)} job card(s). Extracting...\n")
+
+        total_scraped = 0
+
+        for i, card in enumerate(job_cards, start = 1):
+            try:
+                await card.scroll_into_view_if_needed()
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+
+                title_el    = await card.query_selector("h2.jobTitle")
+                company_el  = await card.query_selector('span[data-testid="company-name"]')
+                location_el = await card.query_selector('div[data-testid="text-location"]')
+
+                title    = (await title_el.inner_text()).strip()    if title_el    else "N/A"
+                company  = (await company_el.inner_text()).strip()  if company_el  else "N/A"
+                location = (await location_el.inner_text()).strip() if location_el else search_location
+
+                chips    = await card.query_selector_all('[data-testid="attribute_snippet_testid"]')
+                salary   = "N/A"
+                job_type = "N/A"
+                for chip in chips:
+                    text = (await chip.inner_text()).strip()
+                    if "$" in text or "hour" in text.lower() or "year" in text.lower() or "a year" in text.lower():
+                        salary = text
+                    elif any(t in text.lower() for t in ["full-time", "part-time", "contract", "temporary", "internship"]):
+                        job_type = text
+
+                print(f"[{i}/{len(job_cards)}] {title} @ {company}")
+                print(f"    Job type : {job_type}")
+                print(f"    Salary   : {salary}")
+
+                await card.click()
+                await asyncio.sleep(random.uniform(2, 4))
+
+                description = "N/A"
+                for selector in ["#jobDescriptionText", ".jobsearch-JobComponent-description", ".jobsearch-jobDescriptionText"]:
+                    try:
+                        await page.wait_for_selector(selector, timeout=6000, state="attached")
+                        desc_el = await page.query_selector(selector)
+                        if desc_el:
+                            text = (await desc_el.inner_text()).strip()
+                            if len(text) > 50:
+                                raw_len = len(text)
+                                description = clean_job_description(text, job_title=title)
+                                print(f"    Description: {len(description)} chars (cleaned from {raw_len})")
+                                break
+                    except Exception:
+                        continue
+                
+                if salary == "N/A":
+                    try:
+                        salary_panel_el = await page.query_selector('[data-testid="jobsearch-OtherJobDetailsContainer"]')
+                        if salary_panel_el:
+                            panel_text = await salary_panel_el.inner_text()
+                            for line in panel_text.split("\n"):
+                                if "$" in line or "hour" in line.lower():
+                                    salary = line.strip()
+                                    break
+                    except Exception:
+                        pass
+                
+                link_el = await card.query_selector("h2.jobTitle a")
+                href    = await link_el.get_attribute("href") if link_el else ""
+                job_url = ("https://www.indeed.com" + href) if href and not href.startswith("http") else href
+
+                job_doc = {
+                    "title":           title,
+                    "company":         company,
+                    "location":        location,
+                    "job_type":        job_type,
+                    "salary":          salary,
+                    "description":     description,
+                    "url":             job_url,
+                    "search_query":    search_query,
+                    "search_location": search_location,
+                    "match_score":     None,
+                    "scraped_at":      datetime.now(timezone.utc),
+                }
+
+                await collection.insert_one(job_doc)
+                total_scraped += 1
+                print(f"    Saved to MongoDB\n")
+                
+                await asyncio.sleep(random.uniform(4, 7))
+
+            except Exception as e:
+                print(f"    Error on job {i}: {e} — skipping\n")
+                continue
+
+        await context.close()
+        print(f"Scraping complete. {total_scraped} job(s) saved to MongoDB.")
+
+```
+
+## Data Scraping Call
+
+```{python}
+#| label: run_scraper
+
+await scrape_to_mongo()
+
+```
+
+## Preview Scraped Data
+
+```{python}
+#| label: preview_data
+
+client = AsyncIOMotorClient(mongo_URI)
+collection = client[db_name][collection_name]
+
+total = await collection.count_documents({})
+print(f"Total documents in MongoDB: {total}")
+print("=" * 55)
+
+async for job in collection.find({}, {"_id": 0}):
+    print(f"\nTitle       : {job.get('title')}")
+    print(f"Company     : {job.get('company')}")
+    print(f"Location    : {job.get('location')}")
+    print(f"Salary      : {job.get('salary')}")
+    print(f"Match score : {job.get('match_score')}  ← filled in during NLP step")
+    print(f"URL         : {job.get('url')}")
+    desc = (job.get('description') or 'N/A').replace('\n', ' ')[:200]
+    print(f"Description : {desc}...")
+
+```
+
+# Natural Language Processing (NLP)
+
+The NLP portion of the project compares the user's resume against each scraped job description. The resume is expected to be a PDF located at the path set in the cell below.
+
+## NLP Configuration
+
+```{python}
+#| label: nlp_configuration
+
+resume_path = "/Users/melaniejensen/Library/CloudStorage/OneDrive-SouthernUtahUniversity/CS 4200/Final Project/Melanie J Jensen Resume.pdf"
+
+if not os.path.exists(resume_path):
+    print(f"File not found: {resume_path}")
+    print("Make sure the PDF is in the same folder as this file, or update resume_path above.")
+else:
+    size_kb = os.path.getsize(resume_path) / 1024
+    print(f"Resume found: {resume_path} ({size_kb:.1f} KB)")
+
+```
+
+## Extract Text from Resume (PDF)
+
+```{python}
+#| label: extract_resume_text
+
+def extract_resume_text(pdf_path: str) -> str:
+    doc = fitz.open(pdf_path)
+    pages = [page.get_text() for page in doc]
+    doc.close()
+
+    full_text = "\n".join(pages)
+    full_text = "\n".join(line.strip() for line in full_text.splitlines() if line.strip())
+
+    return full_text
+
+resume_text = extract_resume_text(resume_path)
+
+print(f"Resume extracted successfully.")
+print(f"Total characters : {len(resume_text)}")
+print(f"Total words      : {len(resume_text.split())}")
+print("\n--- Preview (first 500 chars) ---")
+print(resume_text[:500])
+
+```
+
+## Resume Semantic Meaning Extraction
+
+This step loads the sentence-transformers model and generates vector embeddings for both the resume and each job description. The resume is also parsed into dated sections (based on year and month-year patterns) so that each job can later be evaluated against only the professionally relevant portions of the user's background.
+
+```{python}
+#| label: resume_semantic_extraction
+
+print("Loading sentence-transformers model...")
+model = SentenceTransformer("all-MiniLM-L6-v2")
+print("Model loaded.\n")
+
+client = AsyncIOMotorClient(mongo_URI)
+collection = client[db_name][collection_name]
+
+jobs = []
+async for job in collection.find({}, {"_id": 0}):
+    jobs.append(job)
+
+print(f"Loaded {len(jobs)} job(s) from MongoDB.")
+
+print("Embedding resume text...")
+resume_embedding = model.encode(resume_text, convert_to_numpy = True)
+
+print("Embedding job descriptions...")
+descriptions = [job.get("description", "") for job in jobs]
+job_embeddings = model.encode(descriptions, convert_to_numpy = True)
+
+print("\nAll embeddings complete.")
+
+MONTH_MAP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12}
+
+def _parse_date_token(token: str):
+    token = token.strip().lower()
+    if token in ("present", "current", "now"):
+        return datetime.now()
+    
+    m = re.match(r"([a-z]+)\.?\s+(\d{4})", token)
+    if m and m.group(1) in MONTH_MAP:
+        return datetime(int(m.group(2)), MONTH_MAP[m.group(1)], 1)
+    
+    m = re.match(r"^(\d{4})$", token)
+    if m:
+        return datetime(int(m.group(1)), 1, 1)
+    
+    m = re.match(r"(\d{1,2})[/\-](\d{4})", token)
+    if m:
+        return datetime(int(m.group(2)), int(m.group(1)), 1)
+    
+    return None
+
+def parse_resume_sections(resume_text: str) -> list:
+    date_range_pattern = re.compile(
+        r"([A-Za-z]+\.?\s+\d{4}|\d{1,2}[/\-]\d{4}|\d{4})"
+        r"\s*[\-\u2013\u2014to]+\s*"
+        r"([A-Za-z]+\.?\s+\d{4}|\d{1,2}[/\-]\d{4}|\d{4}|[Pp]resent|[Cc]urrent|[Nn]ow)",
+        re.IGNORECASE)
+    
+    matches = list(date_range_pattern.finditer(resume_text))
+    if not matches:
+        return []
+    
+    sections = []
+    for i, m in enumerate(matches):
+        start_date = _parse_date_token(m.group(1))
+        end_date   = _parse_date_token(m.group(2))
+        if not start_date or not end_date:
+            continue
+        
+        ctx_start = max(0, m.start() - 100)
+        ctx_end   = matches[i + 1].start() if i + 1 < len(matches) else min(len(resume_text), m.end() + 500)
+        context   = resume_text[ctx_start:ctx_end].strip()
+        
+        sections.append({
+            "start": start_date,
+            "end":   end_date,
+            "text":  context})
+    
+    return sections
+
+def calculate_relevant_years(
+    job_description: str,
+    resume_sections: list,
+    model,
+    relevance_threshold: float = 0.3) -> int:
+    
+    if not resume_sections:
+        return 0
+    
+    job_emb = model.encode(job_description, convert_to_numpy=True)
+    section_texts = [s["text"] for s in resume_sections]
+    section_embs  = model.encode(section_texts, convert_to_numpy=True)
+    scores = cosine_similarity([job_emb], section_embs)[0]
+    
+    relevant = [s for s, score in zip(resume_sections, scores) if score >= relevance_threshold]
+    
+    if not relevant:
+        relevant = resume_sections
+    
+    earliest_start = min(s["start"] for s in relevant)
+    latest_end     = max(s["end"]   for s in relevant)
+    
+    years = (latest_end - earliest_start).days / 365.25
+    return int(years)
+
+resume_sections = parse_resume_sections(resume_text)
+print(f"Parsed {len(resume_sections)} dated section(s) from resume.")
+
+```
+
+## Calculate and Save Matching Scores
+
+Each job is scored on cosine similarity between the resume embedding and the job description embedding. An explanation is also generated for each job, detailing the top matching requirements and the top gaps relative to the resume. The explanation logic applies the following filters:
+
+- Phrases requesting 2 or more years beyond the resume are classified as gaps rather than matches.
+- The lower bound of a year range (e.g., "5-7 years") is used as the threshold.
+- Jobs requiring 4 or more years beyond the resume are disqualified and assigned a score of 0.
+- Relevant years of experience is calculated per job, using only resume sections that exceed a 0.3 cosine similarity to the job description.
+
+```{python}
+#| label: calculate_match_scores
+
+def extract_required_years(phrase: str):
+    phrase_lower = phrase.lower()
+    
+    m = re.search(r"(\d+)\s*(?:[-\u2013\u2014]|to)\s*(\d+)\s*\+?\s*years?", phrase_lower)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r"(?:at least|minimum of|minimum|min\.?)\s*(\d+)\s*\+?\s*years?", phrase_lower)
+    if m:
+        return int(m.group(1))
+    
+    m = re.search(r"(\d+)\s*\+\s*years?", phrase_lower)
+    if m:
+        return int(m.group(1))
+    
+    m = re.search(r"(\d+)\s*(?:or more|or greater)\s*years?", phrase_lower)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r"(\d+)\s*years?\s+(?:of\s+)?(?:experience|exp\.?|working|in|with)", phrase_lower)
+    if m:
+        return int(m.group(1))
+    
+    return None
+
+def extract_key_phrases(text: str, max_phrases: int = 30) -> list:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    phrases = []
+
+    skill_signals = [
+        "experience", "skill", "knowledge", "ability", "proficiency",
+        "years", "degree", "bachelor", "master", "certif",
+        "python", "sql", "excel", "tableau", "power bi", "r ",
+        "analytic", "data", "model", "communicat", "lead", "manag",
+        "collaborat", "present", "report", "visuali", "statistic",
+        "required", "preferred", "responsible", "responsibilit",
+        "develop", "build", "design", "implement", "create", "maintain",
+        "work with", "familiar", "proficient", "expertise", "understand",
+        "qualification", "duties", "must have", "nice to have",
+        "team", "project", "solution", "problem", "support",
+        "minimum", "plus", "strong", "demonstrated", "proven"]
+    
+    for line in lines:
+        is_bullet  = line.startswith(("•", "-", "*", "·"))
+        has_signal = any(s in line.lower() for s in skill_signals)
+        if (is_bullet or has_signal) and 10 < len(line) < 300:
+            clean = re.sub(r"^[•\-\*·]+\s*", "", line)
+            phrases.append(clean)
+    
+    return phrases[:max_phrases]
+
+def generate_explanation(
+    resume_emb,
+    job_descriptions: str,
+    model,
+    resume_years: int = None,
+    threshold_match: float = 0.35,
+    years_gap_threshold: int = 2,
+    disqualify_gap_threshold: int = 4) -> dict:
+    
+    phrases = extract_key_phrases(job_descriptions)
+
+    if not phrases:
+        return {
+            "top_matches":   ["Could not extract specific requirements from job description."],
+            "top_gaps":      ["Could not extract specific requirements from job description."],
+            "phrase_scores": [],
+            "disqualified":  False,
+            "disqualify_reason": None}
+    
+    phrase_embeddings = model.encode(phrases, convert_to_numpy=True)
+    scores = cosine_similarity([resume_emb], phrase_embeddings)[0]
+    
+    disqualified        = False
+    disqualify_reason   = None
+    max_required        = 0
+    
+    if resume_years is not None:
+        for phrase in phrases:
+            required = extract_required_years(phrase)
+            if required is not None and required > max_required:
+                max_required = required
+        
+        if max_required - resume_years >= disqualify_gap_threshold:
+            disqualified = True
+            disqualify_reason = (
+                f"Score zeroed: requires {max_required} yrs, resume has ~{resume_years}")
+    
+    years_gaps     = []
+    flagged_phrases = set()
+    
+    for phrase, score in zip(phrases, scores.tolist()):
+        required = extract_required_years(phrase)
+        if required is not None and resume_years is not None:
+            gap = required - resume_years
+            if gap >= years_gap_threshold:
+                years_gaps.append(f"{phrase} [needs {required} yrs, resume ~{resume_years}]")
+                flagged_phrases.add(phrase)
+    
+    phrase_scores = sorted(
+        zip(phrases, scores.tolist()),
+        key=lambda x: x[1],
+        reverse=True)
+    
+    top_matches = [
+        f"{phrase} ({score:.2f})"
+        for phrase, score in phrase_scores
+        if score >= threshold_match and phrase not in flagged_phrases]
+    top_matches = top_matches[:5]
+    
+    top_gaps = list(years_gaps)
+    for phrase, score in reversed(phrase_scores):
+        if len(top_gaps) >= 5:
+            break
+        if score < threshold_match and phrase not in flagged_phrases:
+            top_gaps.append(f"{phrase} ({score:.2f})")
+
+    return {
+        "top_matches":       top_matches if top_matches else ["No strong matches found."],
+        "top_gaps":          top_gaps    if top_gaps    else ["No significant gaps found."],
+        "phrase_scores":     [(p, round(s, 4)) for p, s in phrase_scores],
+        "disqualified":      disqualified,
+        "disqualify_reason": disqualify_reason}
+
+print("Scoring and explaining all jobs...\n")
+print("=" * 55)
+
+results = []
+
+for i, (job, job_emb) in enumerate(zip(jobs, job_embeddings), start=1):
+
+    score = float(cosine_similarity([resume_embedding], [job_emb])[0][0])
+
+    job_desc = job.get("description", "")
+    job_resume_years = calculate_relevant_years(job_desc, resume_sections, model)
+    
+    explanation = generate_explanation(
+        resume_embedding,
+        job_desc,
+        model,
+        resume_years=job_resume_years)
+    explanation["resume_years_for_this_job"] = job_resume_years
+
+    if explanation.get("disqualified"):
+        score = 0.0
+
+    await collection.update_one(
+        {"title": job["title"], "company": job["company"]},
+        {"$set": {
+            "match_score":  round(score, 4),
+            "explanation":  explanation}})
+
+    results.append({
+        "title":   job.get("title"),
+        "company": job.get("company"),
+        "score":   round(score, 4),
+        "explanation": explanation})
+
+    print(f"[{i}] {job.get('title')} @ {job.get('company')}")
+    if explanation.get("disqualified"):
+        print(f"     Score : {score:.4f}  ← {explanation['disqualify_reason']}")
+    else:
+        print(f"     Score : {score:.4f}")
+
+print("\nAll scores written to MongoDB.")
+
+```
+
+## Rank the Matching Scores
+
+Jobs are sorted by match score in descending order. Disqualified jobs fall to the bottom of the ranking with a visible note explaining why.
+
+```{python}
+#| label: rank_scores
+
+ranked = sorted(results, key=lambda x: x["score"], reverse=True)
+
+print("\nTop ranked jobs:")
+print("=" * 55)
+
+for rank, job in enumerate(ranked, start = 1):
+    score_pct = job['score'] * 100
+    exp       = job["explanation"]
+
+    print(f"\n#{rank}  {job['title']}")
+    print(f"     Company : {job['company']}")
+    print(f"     Score   : {job['score']:.4f}  ({score_pct:.1f}%)")
+
+    if exp.get("disqualified"):
+        print(f"     *** {exp['disqualify_reason']} ***")
+
+    print("\n     What your resume covers well:")
+    for match in exp["top_matches"]:
+        print(f"       + {match}")
+
+    print("\n     Gaps to address:")
+    for gap in exp["top_gaps"]:
+        print(f"       - {gap}")
+
+    print("\n" + "-" * 55)
+
+```
+
+## Export to CSV
+
+The ranked results are written to job_match_report.csv in the project directory. The file is overwritten on every run so that downstream automation can point to a single, consistent filename.
+
+```{python}
+#| label: export_csv
+
+output_file = "job_match_report.csv"
+
+export_rows = []
+async for job in collection.find({"match_score": {"$ne": None}}, {"_id": 0}):
+    exp = job.get("explanation", {})
+    export_rows.append({
+        "rank":          0,   
+        "title":         job.get("title"),
+        "company":       job.get("company"),
+        "location":      job.get("location"),
+        "salary":        job.get("salary"),
+        "job_type":      job.get("job_type"),
+        "match_score":   job.get("match_score"),
+        "match_pct":     f"{job.get('match_score', 0) * 100:.1f}%",
+        "top_matches":   " | ".join(exp.get("top_matches", [])),
+        "top_gaps":      " | ".join(exp.get("top_gaps",    [])),
+        "url":           job.get("url"),
+        "scraped_at":    str(job.get("scraped_at", "")),
+    })
+
+export_rows.sort(key=lambda x: x["match_score"] or 0, reverse=True)
+for i, row in enumerate(export_rows, start=1):
+    row["rank"] = i
+
+if export_rows:
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=export_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(export_rows)
+    print(f"Exported {len(export_rows)} row(s) to {output_file}")
+    print(f"File saved in the same folder as this file.")
+else:
+    print("No scored jobs found.")
+
+```
+
+# Results and Conclusions
+
+This project successfully automates the front end of the job search process. Scraped listings are stored in a structured database, evaluated against a user-provided resume, filtered for experience-level fit, and exported to a single CSV that can be consumed by future automation steps.
+
+The filtering logic meaningfully improves the quality of the ranking. Boilerplate sections (equal opportunity statements, benefits language, and similar) are removed before scoring so that they do not dilute the match calculation. Years-of-experience requirements are handled explicitly rather than being absorbed into the semantic similarity score, which prevents the model from falsely crediting the resume for experience it does not have. Disqualification at the 4+ year gap threshold ensures that listings well outside the user's qualification range do not surface near the top of the results.
+
+Known limitations of the current implementation include the following:
+
+- The scraper depends on Indeed's current HTML structure and will require maintenance if the site changes.
+- Experience detection is based on dated sections of the resume and assumes consistent date formatting.
+- CAPTCHA encounters require manual resolution through the open browser window.
+
+Planned enhancements:
+
+- Continue Fine-tuning the explanation logic to better surface actionable insights for the user.
+- Scheduling the script to run on a recurring basis.
+- Adding email or text notifications when a match exceeds a configurable threshold.
+- Maintaining a historical record of past runs alongside the current snapshot CSV.
+
+# AI Assistance Disclosure
+
+In accordance with the course Generative AI policy, this section documents the role of AI assistance in the development of this project. Claude (Anthropic) was used throughout the project as a support tool, comparable to a tutor or reference resource.
+
+I determined the overall project scope, workflow design, and sequencing of steps (scraping, storage, embedding, scoring, ranking, export) independently. AI assistance was used for:
+
+- Debugging specific errors encountered during development, including namespace issues between Quarto cells and logic errors in the scoring pipeline.
+- Explaining unfamiliar library behavior (Playwright session handling, sentence-transformers embedding outputs, MongoDB async operations).
+- Discussing tradeoffs when tuning the filtering logic, including threshold values for years-of-experience gaps, semantic relevance cutoffs for resume section matching, and boilerplate detection patterns.
+- Drafting initial versions of helper functions based on requirements I defined, which I then reviewed, adjusted, and integrated into the broader workflow.
+
+All decisions regarding what to build, how components should interact, which filters to apply, and how the output should be structured were made by me. I reviewed each piece of AI-generated code for correctness and fit before incorporating it, and all tuning choices (thresholds, phrase lists, fallback behaviors) were driven by my own evaluation of the project's actual output.
