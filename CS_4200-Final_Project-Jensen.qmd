@@ -85,7 +85,7 @@ The first step of this project is to scrape job listings and their information o
 nest_asyncio.apply()
 reset_session = False
 
-mongo_URI = "mongodb+srv://meljensen328_db_user:Melajens10282003*@cluster0.u3zrhvc.mongodb.net/?appName=Cluster0"
+mongo_URI = [MONGODB_URI_HERE] # Original code redacted for security purposes
 db_name = "indeed_jobs_db"
 collection_name = "listings"
 
@@ -365,7 +365,7 @@ The NLP portion of the project compares the user's resume against each scraped j
 ```{python}
 #| label: nlp_configuration
 
-resume_path = "/Users/melaniejensen/Library/CloudStorage/OneDrive-SouthernUtahUniversity/CS 4200/Final Project/Melanie J Jensen Resume.pdf"
+resume_path = [RESUME_PATH_HERE] # Original Code Redacted for security purposes
 
 if not os.path.exists(resume_path):
     print(f"File not found: {resume_path}")
